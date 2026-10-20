@@ -148,15 +148,7 @@ fn process_svg_impl(
 
     let mut lightnesses = Vec::new();
     collect_colors(&root, primary, &mut lightnesses);
-    // Insert after collecting: the fallback fill isn't part of the icon's
-    // actual palette and must not skew single-color detection below.
-    if !root
-        .attributes
-        .keys()
-        .any(|name| local_name(name) == "fill")
-    {
-        root.attributes.insert("fill".into(), "rgb(0,0,0)".into());
-    }
+    insert_default_fill(&mut root, primary, &mut lightnesses);
     if lightnesses.is_empty() {
         return serialize(&root);
     }
@@ -211,15 +203,7 @@ fn process_svg_with_palette_impl(
     }
     let mut lightnesses = Vec::new();
     collect_colors(&root, primary_hsl, &mut lightnesses);
-    // Insert after collecting: the fallback fill isn't part of the icon's
-    // actual palette and must not skew single-color detection below.
-    if !root
-        .attributes
-        .keys()
-        .any(|name| local_name(name) == "fill")
-    {
-        root.attributes.insert("fill".into(), "rgb(0,0,0)".into());
-    }
+    insert_default_fill(&mut root, primary_hsl, &mut lightnesses);
     if lightnesses.is_empty() {
         return serialize(&root);
     }
@@ -394,6 +378,27 @@ fn transform_palette_style(
         })
         .collect::<Vec<_>>()
         .join(";")
+}
+
+/// SVG paints any shape without an explicit fill black. Making that default explicit on the root
+/// lets the transform below recolor it together with the icon's own colors.
+fn insert_default_fill(root: &mut Element, primary: Hsl, lightnesses: &mut Vec<f64>) {
+    const DEFAULT_FILL: &str = "rgb(0,0,0)";
+    if root
+        .attributes
+        .keys()
+        .any(|name| local_name(name) == "fill")
+    {
+        return;
+    }
+    root.attributes.insert("fill".into(), DEFAULT_FILL.into());
+    // Insert after collecting: the fallback fill isn't part of the icon's actual palette and
+    // must not skew single-color detection. The exception is an icon with no explicit paint at
+    // all (e.g. Flask): it is drawn entirely in that default, so the fallback is its whole
+    // palette. Without its tone the icon would be returned untransformed, i.e. still black.
+    if lightnesses.is_empty() {
+        lightnesses.extend(color_lightness(DEFAULT_FILL, primary));
+    }
 }
 
 fn collect_colors(element: &Element, primary: Hsl, output: &mut Vec<f64>) {
@@ -945,6 +950,56 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn icon_without_explicit_paint_resolves_to_palette_midpoint() {
+        // Mirrors the Flask logo: no color anywhere, so it is drawn entirely in SVG's implicit
+        // default black. That default is its only tone, so it must be recolored like any other
+        // single-color icon instead of being returned black.
+        let input = r##"<svg xmlns="http://www.w3.org/2000/svg" style="fill-rule:evenodd;"><path d="M0 0h1v1z" style="fill-rule:nonzero;"/></svg>"##;
+        let result =
+            process_svg_with_palette_impl(input, "#ff0000", "#0000ff", 1.0, 0.0, "rgb").unwrap();
+        assert!(result.contains("fill=\"rgb(255,0,255)\""));
+        assert!(!result.contains("rgb(0,0,0)"));
+    }
+
+    #[test]
+    fn icon_without_explicit_paint_resolves_to_primary_color() {
+        let input = r##"<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0h1v1z"/></svg>"##;
+        let result = process_svg_impl(input, "#00acc1", 0.2, "rgb").unwrap();
+        let primary_hsl = rgb_to_hsl(parse_color("#00acc1").unwrap());
+        let expected = format_rgb(hsl_to_rgb(Hsl {
+            hue: primary_hsl.hue,
+            saturation: primary_hsl.saturation,
+            lightness: (primary_hsl.lightness.clamp(0.0, 1.0) * 255.0).round() / 255.0,
+        }));
+        assert!(result.contains(format!("fill=\"{expected}\"").as_str()));
+        assert!(!result.contains("rgb(0,0,0)"));
+    }
+
+    #[test]
+    fn icon_with_paint_only_inside_a_mask_recolors_its_default_fill() {
+        // Mask paint is excluded from the palette, so the visible shape's implicit default black
+        // is still the icon's only tone.
+        let input = r##"<svg xmlns="http://www.w3.org/2000/svg"><mask id="m"><rect fill="#fff"/></mask><path mask="url(#m)"/></svg>"##;
+        let result =
+            process_svg_with_palette_impl(input, "#ff0000", "#0000ff", 1.0, 0.0, "rgb").unwrap();
+        assert_eq!(result.matches("fill=\"#fff\"").count(), 1);
+        assert!(result.contains("fill=\"rgb(255,0,255)\""));
+    }
+
+    #[test]
+    fn explicit_non_color_root_fill_is_neither_replaced_nor_recolored() {
+        let input =
+            r##"<svg xmlns="http://www.w3.org/2000/svg" fill="none"><path d="M0 0h1v1z"/></svg>"##;
+        let single = process_svg_impl(input, "#00acc1", 0.2, "rgb").unwrap();
+        let palette =
+            process_svg_with_palette_impl(input, "#ff0000", "#0000ff", 1.0, 0.0, "rgb").unwrap();
+        for result in [single, palette] {
+            assert!(result.contains("fill=\"none\""));
+            assert!(!result.contains("rgb("));
+        }
     }
 
     #[test]
