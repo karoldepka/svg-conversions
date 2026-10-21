@@ -3,6 +3,11 @@ const DEFAULT_POOL_SIZE = Math.max(
   Math.min(4, globalThis.navigator?.hardwareConcurrency ?? 2),
 );
 
+// Jobs handed to one worker before its earlier results come back. A worker only gets more work
+// once the page's main thread handles a reply, so with a single job it idles whenever the main
+// thread is busy (e.g. rendering the icons it just converted).
+const MAX_JOBS_PER_WORKER = 4;
+
 export class SvgWorkerPool {
   #workers = [];
   #queue = [];
@@ -16,7 +21,7 @@ export class SvgWorkerPool {
     }
     for (let index = 0; index < size; index += 1) {
       const worker = new Worker(workerUrl, { type: "module" });
-      const slot = { worker, busy: false };
+      const slot = { worker, jobs: 0 };
       worker.addEventListener("message", ({ data }) => this.#settle(slot, data));
       worker.addEventListener("error", (event) => this.#failWorker(slot, event));
       this.#workers.push(slot);
@@ -28,6 +33,14 @@ export class SvgWorkerPool {
       return Promise.reject(new TypeError("svg must be a string"));
     }
     return this.#enqueue("process", { svg, ...options });
+  }
+
+  /** Recolors a raster image (e.g. a PNG logo) at an absolute `url`; resolves to a PNG data URL. */
+  processRaster(url, options = {}) {
+    if (typeof url !== "string") {
+      return Promise.reject(new TypeError("url must be a string"));
+    }
+    return this.#enqueue("processRaster", { url, ...options });
   }
 
   generateColorMap(primaryColor = "#00acc1") {
@@ -55,10 +68,11 @@ export class SvgWorkerPool {
   }
 
   #dispatch() {
-    for (const slot of this.#workers) {
-      if (slot.busy || this.#queue.length === 0) continue;
+    while (this.#queue.length > 0) {
+      const slot = this.#workers.reduce((least, candidate) => candidate.jobs < least.jobs ? candidate : least);
+      if (slot.jobs >= MAX_JOBS_PER_WORKER) return;
       const task = this.#queue.shift();
-      slot.busy = true;
+      slot.jobs += 1;
       this.#pending.set(task.id, { ...task, slot });
       slot.worker.postMessage({ id: task.id, operation: task.operation, payload: task.payload });
     }
@@ -68,19 +82,19 @@ export class SvgWorkerPool {
     const task = this.#pending.get(id);
     if (!task) return;
     this.#pending.delete(id);
-    slot.busy = false;
+    slot.jobs -= 1;
     if (error) task.reject(new Error(error));
     else task.resolve(result);
     this.#dispatch();
   }
 
   #failWorker(slot, event) {
-    const task = [...this.#pending.values()].find((item) => item.slot === slot);
-    if (task) {
+    const error = event.error ?? new Error(event.message || "SVG worker failed");
+    for (const task of [...this.#pending.values()].filter((item) => item.slot === slot)) {
       this.#pending.delete(task.id);
-      task.reject(event.error ?? new Error(event.message || "SVG worker failed"));
+      task.reject(error);
     }
-    slot.busy = false;
+    slot.jobs = 0;
     this.#dispatch();
   }
 }

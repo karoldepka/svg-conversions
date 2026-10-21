@@ -32,6 +32,60 @@ export function generate_color_map(primary_color) {
 }
 
 /**
+ * Raster (e.g. PNG logo) counterpart of process_svg: recolors decoded RGBA pixels in place.
+ * Each pixel's tone is mapped like an SVG paint, with the image's visible tones as the bounds;
+ * alpha is kept, so anti-aliased edges stay smooth.
+ * @param {Uint8Array} rgba
+ * @param {string} primary_color
+ * @param {number} tolerance
+ */
+export function process_rgba(rgba, primary_color, tolerance) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        var ptr0 = passArray8ToWasm0(rgba, wasm.__wbindgen_export);
+        var len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(primary_color, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len1 = WASM_VECTOR_LEN;
+        wasm.process_rgba(retptr, ptr0, len0, addHeapObject(rgba), ptr1, len1, tolerance);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        if (r1) {
+            throw takeObject(r0);
+        }
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
+ * Raster counterpart of process_svg_with_palette; see process_rgba.
+ * @param {Uint8Array} rgba
+ * @param {string} primary_color
+ * @param {string} secondary_color
+ * @param {number} contrast
+ * @param {number} brightness
+ */
+export function process_rgba_with_palette(rgba, primary_color, secondary_color, contrast, brightness) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        var ptr0 = passArray8ToWasm0(rgba, wasm.__wbindgen_export);
+        var len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(primary_color, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len1 = WASM_VECTOR_LEN;
+        const ptr2 = passStringToWasm0(secondary_color, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+        const len2 = WASM_VECTOR_LEN;
+        wasm.process_rgba_with_palette(retptr, ptr0, len0, addHeapObject(rgba), ptr1, len1, ptr2, len2, contrast, brightness);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        if (r1) {
+            throw takeObject(r0);
+        }
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
  * @param {string} svg
  * @param {string} primary_color
  * @param {number} tolerance
@@ -122,6 +176,12 @@ function __wbg_get_imports() {
             const ret = Error(getStringFromWasm0(arg0, arg1));
             return addHeapObject(ret);
         },
+        __wbg___wbindgen_copy_to_typed_array_4db0cbe2cc60dbee: function(arg0, arg1, arg2) {
+            new Uint8Array(getObject(arg2).buffer, getObject(arg2).byteOffset, getObject(arg2).byteLength).set(getArrayU8FromWasm0(arg0, arg1));
+        },
+        __wbindgen_object_drop_ref: function(arg0) {
+            takeObject(arg0);
+        },
     };
     return {
         __proto__: null,
@@ -142,6 +202,11 @@ function dropObject(idx) {
     if (idx < 1028) return;
     heap[idx] = heap_next;
     heap_next = idx;
+}
+
+function getArrayU8FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getUint8ArrayMemory0().subarray(ptr / 1, ptr / 1 + len);
 }
 
 let cachedDataViewMemory0 = null;
@@ -170,6 +235,13 @@ let heap = new Array(1024).fill(undefined);
 heap.push(undefined, null, true, false);
 
 let heap_next = heap.length;
+
+function passArray8ToWasm0(arg, malloc) {
+    const ptr = malloc(arg.length * 1, 1) >>> 0;
+    getUint8ArrayMemory0().set(arg, ptr / 1);
+    WASM_VECTOR_LEN = arg.length;
+    return ptr;
+}
 
 function passStringToWasm0(arg, malloc, realloc) {
     if (realloc === undefined) {

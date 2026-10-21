@@ -1,5 +1,5 @@
 use csscolorparser::Color;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use wasm_bindgen::prelude::*;
 use xmltree::{Element, EmitterConfig, XMLNode};
@@ -130,6 +130,139 @@ pub fn generate_color_map(primary_color: &str) -> Result<String, JsError> {
     generate_color_map_document(primary_color).map_err(|error| JsError::new(&error))
 }
 
+/// Raster (e.g. PNG logo) counterpart of process_svg: recolors decoded RGBA pixels in place.
+/// Each pixel's tone is mapped like an SVG paint, with the image's visible tones as the bounds;
+/// alpha is kept, so anti-aliased edges stay smooth.
+#[wasm_bindgen]
+pub fn process_rgba(rgba: &mut [u8], primary_color: &str, tolerance: f64) -> Result<(), JsError> {
+    process_rgba_impl(rgba, primary_color, tolerance).map_err(|error| JsError::new(&error))
+}
+
+/// Raster counterpart of process_svg_with_palette; see process_rgba.
+#[wasm_bindgen]
+pub fn process_rgba_with_palette(
+    rgba: &mut [u8],
+    primary_color: &str,
+    secondary_color: &str,
+    contrast: f64,
+    brightness: f64,
+) -> Result<(), JsError> {
+    process_rgba_with_palette_impl(rgba, primary_color, secondary_color, contrast, brightness)
+        .map_err(|error| JsError::new(&error))
+}
+
+fn process_rgba_impl(rgba: &mut [u8], primary_color: &str, tolerance: f64) -> Result<(), String> {
+    if !tolerance.is_finite() || !(0.0..=1.0).contains(&tolerance) {
+        return Err("tolerance must be a finite number between 0 and 1".into());
+    }
+    let primary = rgb_to_hsl(parse_color(primary_color)?);
+    let Some(tones) = raster_tones(rgba)? else {
+        return Ok(());
+    };
+    let reference = Boundaries {
+        low: (1.0 - tolerance) * primary.lightness,
+        high: (1.0 + tolerance) * primary.lightness,
+    };
+    let lookup: Vec<Color> = (0..=255u8)
+        .map(|gray| {
+            let index = transformed_index(
+                gray_lightness(gray),
+                primary,
+                reference,
+                tones.bounds,
+                tones.unique_count,
+            );
+            transformed_rgb(index, primary)
+        })
+        .collect();
+    recolor_pixels(rgba, &lookup);
+    Ok(())
+}
+
+fn process_rgba_with_palette_impl(
+    rgba: &mut [u8],
+    primary_color: &str,
+    secondary_color: &str,
+    contrast: f64,
+    brightness: f64,
+) -> Result<(), String> {
+    if !contrast.is_finite() || !(0.0..=2.0).contains(&contrast) {
+        return Err("contrast must be a finite number between 0 and 2".into());
+    }
+    if !brightness.is_finite() || !(-1.0..=1.0).contains(&brightness) {
+        return Err("brightness must be a finite number between -1 and 1".into());
+    }
+    let primary = parse_color(primary_color)?;
+    let secondary = parse_color(secondary_color)?;
+    let Some(tones) = raster_tones(rgba)? else {
+        return Ok(());
+    };
+    let lookup: Vec<Color> = (0..=255u8)
+        .map(|gray| {
+            let amount = palette_amount(gray_lightness(gray), tones.bounds, contrast);
+            palette_rgb(amount, &primary, &secondary, brightness)
+        })
+        .collect();
+    recolor_pixels(rgba, &lookup);
+    Ok(())
+}
+
+/// Pixels at least this opaque define a raster's tones; fainter anti-aliasing fringes must not
+/// stretch the bounds (they are still recolored).
+const MIN_TONE_ALPHA: u8 = 128;
+
+struct RasterTones {
+    bounds: Boundaries,
+    unique_count: usize,
+}
+
+fn raster_tones(rgba: &[u8]) -> Result<Option<RasterTones>, String> {
+    if rgba.len() % 4 != 0 {
+        return Err("RGBA pixel data length must be a multiple of 4".into());
+    }
+    let tones_of = |min_alpha: u8| {
+        let mut seen = [false; 256];
+        for pixel in rgba.chunks_exact(4).filter(|pixel| pixel[3] >= min_alpha) {
+            seen[pixel_gray(pixel) as usize] = true;
+        }
+        seen
+    };
+    // An image that is faint everywhere still has tones: fall back to every visible pixel.
+    let mut seen = tones_of(MIN_TONE_ALPHA);
+    if !seen.contains(&true) {
+        seen = tones_of(1);
+    }
+    let low = seen.iter().position(|&tone| tone);
+    let high = seen.iter().rposition(|&tone| tone);
+    Ok(low.zip(high).map(|(low, high)| RasterTones {
+        bounds: Boundaries {
+            low: gray_lightness(low as u8),
+            high: gray_lightness(high as u8),
+        },
+        unique_count: seen.iter().filter(|&&tone| tone).count(),
+    }))
+}
+
+/// Same weighting and rounding as color_lightness, so a pixel and an equal SVG paint get one tone.
+fn pixel_gray(pixel: &[u8]) -> u8 {
+    (0.3 * f64::from(pixel[0]) + 0.59 * f64::from(pixel[1]) + 0.11 * f64::from(pixel[2])).round()
+        as u8
+}
+
+fn gray_lightness(gray: u8) -> f64 {
+    f64::from(gray) / 255.0
+}
+
+/// Recolors every visible pixel through a 256-entry tone -> color lookup, keeping its alpha.
+fn recolor_pixels(rgba: &mut [u8], lookup: &[Color]) {
+    for pixel in rgba.chunks_exact_mut(4).filter(|pixel| pixel[3] > 0) {
+        let color = &lookup[pixel_gray(pixel) as usize];
+        pixel[0] = (color.r * 255.0).round() as u8;
+        pixel[1] = (color.g * 255.0).round() as u8;
+        pixel[2] = (color.b * 255.0).round() as u8;
+    }
+}
+
 fn process_svg_impl(
     svg: &str,
     primary_color: &str,
@@ -152,6 +285,7 @@ fn process_svg_impl(
     if lightnesses.is_empty() {
         return serialize(&root);
     }
+    pin_mask_paint(&mut root, &HashMap::new());
     let unique_count = lightnesses
         .iter()
         .map(|value| (value * 1_000_000.0).round() as i64)
@@ -207,6 +341,7 @@ fn process_svg_with_palette_impl(
     if lightnesses.is_empty() {
         return serialize(&root);
     }
+    pin_mask_paint(&mut root, &HashMap::new());
     let bounds = Boundaries {
         low: lightnesses.iter().copied().fold(f64::INFINITY, f64::min),
         high: lightnesses
@@ -314,6 +449,17 @@ fn palette_color(
     brightness: f64,
     mode: OutputMode,
 ) -> String {
+    let amount = palette_amount(lightness, bounds, contrast);
+    if mode == OutputMode::CssVars {
+        // CSS-variable output is an indexed palette with no lightness transform available at
+        // this stage. The browser UI uses RGB output, where brightness is applied below.
+        return format!("var(--palette-{:.0})", amount * 255.0);
+    }
+    format_rgb(palette_rgb(amount, primary, secondary, brightness))
+}
+
+/// Position (0..=1) of a source tone between the palette's primary and secondary endpoints.
+fn palette_amount(lightness: f64, bounds: Boundaries, contrast: f64) -> f64 {
     let normalized = if bounds.range().abs() < f64::EPSILON {
         0.5
     } else {
@@ -322,12 +468,10 @@ fn palette_color(
     // Contrast belongs to the source-tone -> palette-position mapping. Applying brightness here
     // would instead move a color toward `primary` or `secondary`, changing its hue/chroma and
     // making a brightness slider look like a saturation control.
-    let amount = ((normalized - 0.5) * contrast + 0.5).clamp(0.0, 1.0);
-    if mode == OutputMode::CssVars {
-        // CSS-variable output is an indexed palette with no lightness transform available at
-        // this stage. The browser UI uses RGB output, where brightness is applied below.
-        return format!("var(--palette-{:.0})", amount * 255.0);
-    }
+    ((normalized - 0.5) * contrast + 0.5).clamp(0.0, 1.0)
+}
+
+fn palette_rgb(amount: f64, primary: &Color, secondary: &Color, brightness: f64) -> Color {
     // RGB interpolation turns saturated endpoints into gray/muddy midpoint colors (for example
     // yellow -> blue). Interpolate hue/value in HSV and retain the strongest endpoint chroma so
     // lighter icon tones do not become desaturated simply because they are lighter.
@@ -344,7 +488,7 @@ fn palette_color(
     } else {
         palette_hsv.value * (1.0 + brightness)
     };
-    format_rgb(hsv_to_rgb(palette_hsv))
+    hsv_to_rgb(palette_hsv)
 }
 
 fn transform_palette_style(
@@ -399,6 +543,56 @@ fn insert_default_fill(root: &mut Element, primary: Hsl, lightnesses: &mut Vec<f
     if lightnesses.is_empty() {
         lightnesses.extend(color_lightness(DEFAULT_FILL, primary));
     }
+}
+
+/// Paint properties whose inherited values reach a mask's contents.
+const MASK_INHERITED_PAINT: [&str; 3] = ["fill", "stroke", "color"];
+
+/// Mask contents inherit paint from the mask's ancestors (e.g. the root), not from the masked
+/// element. The transform recolors those ancestors but skips masks, so first pin onto each mask
+/// the original inherited paint it doesn't set itself. Otherwise a recolored root fill leaks into
+/// the mask and changes its luminance: a black cut-out would turn half-opaque.
+fn pin_mask_paint(element: &mut Element, inherited: &HashMap<&'static str, String>) {
+    if local_name(&element.name) == "mask" {
+        for (&property, value) in inherited {
+            if declared_paint(element, property).is_none() {
+                element.attributes.insert(property.into(), value.clone());
+            }
+        }
+        return;
+    }
+    let mut inherited_by_children = inherited.clone();
+    for property in MASK_INHERITED_PAINT {
+        if let Some(value) = declared_paint(element, property) {
+            if !value.eq_ignore_ascii_case("inherit") {
+                inherited_by_children.insert(property, value);
+            }
+        }
+    }
+    for child in &mut element.children {
+        if let XMLNode::Element(child) = child {
+            pin_mask_paint(child, &inherited_by_children);
+        }
+    }
+}
+
+/// The element's own value for a paint property: its inline style wins over its attribute.
+fn declared_paint(element: &Element, property: &str) -> Option<String> {
+    let from_style = element
+        .attributes
+        .iter()
+        .filter(|(name, _)| local_name(name) == "style")
+        .flat_map(|(_, style)| style_declarations(style))
+        .filter(|(name, _)| *name == property)
+        .last()
+        .map(|(_, value)| value.to_owned());
+    from_style.or_else(|| {
+        element
+            .attributes
+            .iter()
+            .find(|(name, _)| local_name(name) == property)
+            .map(|(_, value)| value.clone())
+    })
 }
 
 fn collect_colors(element: &Element, primary: Hsl, output: &mut Vec<f64>) {
@@ -618,6 +812,23 @@ fn transformed_color(
     unique_count: usize,
     mode: OutputMode,
 ) -> String {
+    let normalized_index =
+        transformed_index(lightness, primary, reference, svg_bounds, unique_count);
+    if mode == OutputMode::CssVars {
+        format!("var(--primary-l-{normalized_index})")
+    } else {
+        format_rgb(transformed_rgb(normalized_index, primary))
+    }
+}
+
+/// The 0..=255 lightness step (of the primary color's hue/saturation) a source tone maps to.
+fn transformed_index(
+    lightness: f64,
+    primary: Hsl,
+    reference: Boundaries,
+    svg_bounds: Boundaries,
+    unique_count: usize,
+) -> u8 {
     let scaled = if svg_bounds.range().abs() < f64::EPSILON {
         primary.lightness
     } else {
@@ -628,21 +839,19 @@ fn transformed_color(
     } else {
         scaled
     };
-    let normalized_index = if unique_count == 1 {
+    if unique_count == 1 {
         (primary.lightness.clamp(0.0, 1.0) * 255.0).round() as u8
     } else {
         (target_lightness.clamp(0.0, 1.0) * 255.0).round() as u8
-    };
-    if mode == OutputMode::CssVars {
-        format!("var(--primary-l-{normalized_index})")
-    } else {
-        let normalized = Hsl {
-            hue: primary.hue,
-            saturation: primary.saturation,
-            lightness: normalized_index as f64 / 255.0,
-        };
-        format_rgb(hsl_to_rgb(normalized))
     }
+}
+
+fn transformed_rgb(normalized_index: u8, primary: Hsl) -> Color {
+    hsl_to_rgb(Hsl {
+        hue: primary.hue,
+        saturation: primary.saturation,
+        lightness: normalized_index as f64 / 255.0,
+    })
 }
 
 fn color_lightness(value: &str, primary: Hsl) -> Option<f64> {
@@ -1028,5 +1237,109 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn rgb_of(pixel: &[u8]) -> String {
+        format!("rgb({},{},{})", pixel[0], pixel[1], pixel[2])
+    }
+
+    #[test]
+    fn raster_palette_maps_darkest_to_primary_and_lightest_to_secondary() {
+        let mut rgba = [0, 0, 0, 255, 255, 255, 255, 255, 9, 9, 9, 0];
+        process_rgba_with_palette_impl(&mut rgba, "#ff0000", "#0000ff", 1.0, 0.0).unwrap();
+        assert_eq!(rgb_of(&rgba[0..4]), "rgb(255,0,0)");
+        assert_eq!(rgb_of(&rgba[4..8]), "rgb(0,0,255)");
+        // Fully transparent pixels are left alone; alpha is never changed.
+        assert_eq!(&rgba[8..12], &[9, 9, 9, 0]);
+        assert_eq!((rgba[3], rgba[7]), (255, 255));
+    }
+
+    #[test]
+    fn raster_and_svg_paints_of_the_same_tones_get_the_same_colors() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg"><path fill="#000"/><path fill="#808080"/></svg>"##;
+        let mut rgba = [0, 0, 0, 255, 128, 128, 128, 255];
+
+        let converted =
+            process_svg_with_palette_impl(svg, "#ff0000", "#0000ff", 1.0, 0.0, "rgb").unwrap();
+        process_rgba_with_palette_impl(&mut rgba, "#ff0000", "#0000ff", 1.0, 0.0).unwrap();
+        assert!(converted.contains(&format!("fill=\"{}\"", rgb_of(&rgba[0..4]))));
+        assert!(converted.contains(&format!("fill=\"{}\"", rgb_of(&rgba[4..8]))));
+
+        let converted = process_svg_impl(svg, "#00acc1", 0.3, "rgb").unwrap();
+        let mut rgba = [0, 0, 0, 255, 128, 128, 128, 255];
+        process_rgba_impl(&mut rgba, "#00acc1", 0.3).unwrap();
+        assert!(converted.contains(&format!("fill=\"{}\"", rgb_of(&rgba[0..4]))));
+        assert!(converted.contains(&format!("fill=\"{}\"", rgb_of(&rgba[4..8]))));
+    }
+
+    #[test]
+    fn raster_single_tone_resolves_to_primary_color() {
+        // One tone (anti-aliasing only in alpha), like a single-color SVG icon.
+        let mut rgba = [20, 20, 20, 255, 20, 20, 20, 90];
+        process_rgba_impl(&mut rgba, "#00acc1", 0.2).unwrap();
+        let primary_hsl = rgb_to_hsl(parse_color("#00acc1").unwrap());
+        let expected = format_rgb(transformed_rgb(
+            (primary_hsl.lightness * 255.0).round() as u8,
+            primary_hsl,
+        ));
+        assert_eq!(rgb_of(&rgba[0..4]), expected);
+        assert_eq!(rgb_of(&rgba[4..8]), expected);
+        assert_eq!(rgba[7], 90);
+    }
+
+    #[test]
+    fn faint_raster_fringe_does_not_stretch_the_tone_bounds() {
+        // A nearly transparent white fringe must not become the "lightest" tone: the opaque
+        // black/gray pair alone sets the bounds, so gray still maps to the secondary color.
+        let mut rgba = [0, 0, 0, 255, 128, 128, 128, 255, 255, 255, 255, 20];
+        process_rgba_with_palette_impl(&mut rgba, "#ff0000", "#0000ff", 1.0, 0.0).unwrap();
+        assert_eq!(rgb_of(&rgba[4..8]), "rgb(0,0,255)");
+    }
+
+    #[test]
+    fn raster_rejects_partial_pixels() {
+        assert!(
+            process_rgba_with_palette_impl(&mut [0, 0, 0], "#ff0000", "#0000ff", 1.0, 0.0).is_err()
+        );
+    }
+
+    /// The `<mask ...>` start tag of a converted document.
+    fn mask_tag(svg: &str) -> &str {
+        let start = svg.find("<mask").unwrap();
+        &svg[start..start + svg[start..].find('>').unwrap()]
+    }
+
+    #[test]
+    fn mask_cut_out_keeps_the_implicit_black_it_inherits() {
+        // SVGO output of a black icon with a hole: the hole <circle> has no fill and inherits the
+        // root's default black, which must stay black (transparent in the mask) after recoloring.
+        let input = r##"<svg xmlns="http://www.w3.org/2000/svg"><mask id="a"><path fill="#fff" d="M0 0h10v10H0z"/><circle cx="5" cy="5" r="3"/></mask><path d="M0 0h10v10H0z" mask="url(#a)"/></svg>"##;
+        let palette =
+            process_svg_with_palette_impl(input, "#ff0000", "#0000ff", 1.0, 0.0, "rgb").unwrap();
+        assert!(mask_tag(&palette).contains("fill=\"rgb(0,0,0)\""));
+        assert!(palette.contains("fill=\"rgb(255,0,255)\""));
+        let single = process_svg_impl(input, "#00acc1", 0.2, "rgb").unwrap();
+        assert!(mask_tag(&single).contains("fill=\"rgb(0,0,0)\""));
+    }
+
+    #[test]
+    fn mask_keeps_the_original_authored_paint_it_inherits() {
+        let input = r##"<svg xmlns="http://www.w3.org/2000/svg" fill="#123456"><g style="stroke:#000"><mask id="a"><circle/></mask></g><path mask="url(#a)"/></svg>"##;
+        let result =
+            process_svg_with_palette_impl(input, "#ff0000", "#0000ff", 1.0, 0.0, "rgb").unwrap();
+        let mask = mask_tag(&result);
+        assert!(mask.contains("fill=\"#123456\""));
+        assert!(mask.contains("stroke=\"#000\""));
+        assert!(!result.contains("<svg xmlns=\"http://www.w3.org/2000/svg\" fill=\"#123456\""));
+    }
+
+    #[test]
+    fn mask_paint_of_its_own_is_left_as_is() {
+        let input = r##"<svg xmlns="http://www.w3.org/2000/svg"><mask id="a" style="fill:#fff"><circle/></mask><path fill="#000" mask="url(#a)"/></svg>"##;
+        let result =
+            process_svg_with_palette_impl(input, "#ff0000", "#0000ff", 1.0, 0.0, "rgb").unwrap();
+        let mask = mask_tag(&result);
+        assert!(mask.contains("style=\"fill:#fff\""));
+        assert!(!mask.contains(" fill="));
     }
 }

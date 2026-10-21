@@ -3,6 +3,18 @@
 
 export function generate_color_map(primary_color: string): string;
 
+/**
+ * Raster (e.g. PNG logo) counterpart of process_svg: recolors decoded RGBA pixels in place.
+ * Each pixel's tone is mapped like an SVG paint, with the image's visible tones as the bounds;
+ * alpha is kept, so anti-aliased edges stay smooth.
+ */
+export function process_rgba(rgba: Uint8Array, primary_color: string, tolerance: number): void;
+
+/**
+ * Raster counterpart of process_svg_with_palette; see process_rgba.
+ */
+export function process_rgba_with_palette(rgba: Uint8Array, primary_color: string, secondary_color: string, contrast: number, brightness: number): void;
+
 export function process_svg(svg: string, primary_color: string, tolerance: number, output_mode: string): string;
 
 /**
@@ -19,6 +31,8 @@ export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembl
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
     readonly generate_color_map: (a: number, b: number, c: number) => void;
+    readonly process_rgba: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly process_rgba_with_palette: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number) => void;
     readonly process_svg: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly process_svg_with_palette: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number) => void;
     readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
