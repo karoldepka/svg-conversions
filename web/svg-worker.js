@@ -77,7 +77,16 @@ self.addEventListener("message", async ({ data }) => {
             }));
             return { icons, processingMs: performance.now() - startedAt };
           })()
-          : convert(payload.svg);
+          : operation === "processMany"
+            // One message for many icons: each item fails on its own instead of failing the batch.
+            ? payload.svgs.map((svg) => {
+              try {
+                return { result: convert(svg) };
+              } catch (error) {
+                return { error: error instanceof Error ? error.message : String(error) };
+              }
+            })
+            : convert(payload.svg);
     self.postMessage({ id, result });
   } catch (error) {
     self.postMessage({

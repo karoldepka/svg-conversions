@@ -35,6 +35,18 @@ export class SvgWorkerPool {
     return this.#enqueue("process", { svg, ...options });
   }
 
+  /**
+   * Converts several SVGs with the same options in one worker message; resolves to one
+   * `{ result }` or `{ error }` per input, in order. Far fewer messages than one process() call
+   * per icon, which matters when the page's main thread handles every reply.
+   */
+  processMany(svgs, options = {}) {
+    if (!Array.isArray(svgs) || svgs.some((svg) => typeof svg !== "string")) {
+      return Promise.reject(new TypeError("svgs must be an array of strings"));
+    }
+    return this.#enqueue("processMany", { svgs, ...options });
+  }
+
   /** Recolors a raster image (e.g. a PNG logo) at an absolute `url`; resolves to a PNG data URL. */
   processRaster(url, options = {}) {
     if (typeof url !== "string") {
